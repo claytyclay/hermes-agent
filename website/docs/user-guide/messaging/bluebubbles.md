@@ -36,7 +36,21 @@ Or set environment variables directly in `~/.hermes/.env`:
 ```bash
 BLUEBUBBLES_SERVER_URL=http://192.168.1.10:1234
 BLUEBUBBLES_PASSWORD=your-server-password
+BLUEBUBBLES_WEBHOOK_SECRET=separate-random-inbound-secret
 ```
+
+If Hermes uses the same Apple account as Messages on the server Mac and you
+want to talk to it through Message Yourself, enable self-chat mode and set the
+home channel to that account's exact iMessage address:
+
+```bash
+BLUEBUBBLES_SELF_CHAT=true
+BLUEBUBBLES_HOME_CHANNEL=user@icloud.com
+```
+
+Self-chat mode accepts own-account messages only in the configured home thread.
+Hermes records its outbound text briefly so BlueBubbles webhook echoes are
+acknowledged without creating a reply loop.
 
 #### Optional: Require mentions in group chats
 
@@ -109,10 +123,12 @@ Hermes → BlueBubbles REST API → Messages.app → iMessage
 |----------|----------|---------|-------------|
 | `BLUEBUBBLES_SERVER_URL` | Yes | — | BlueBubbles server URL |
 | `BLUEBUBBLES_PASSWORD` | Yes | — | Server password |
+| `BLUEBUBBLES_WEBHOOK_SECRET` | No | Server password | Separate secret used only to authenticate inbound webhooks. Recommended so BlueBubbles webhook logs do not expose the server API password. |
 | `BLUEBUBBLES_WEBHOOK_HOST` | No | `127.0.0.1` | Webhook listener bind address |
 | `BLUEBUBBLES_WEBHOOK_PORT` | No | `8645` | Webhook listener port |
 | `BLUEBUBBLES_WEBHOOK_PATH` | No | `/bluebubbles-webhook` | Webhook URL path |
 | `BLUEBUBBLES_HOME_CHANNEL` | No | — | Phone/email for cron delivery |
+| `BLUEBUBBLES_SELF_CHAT` | No | `false` | Process own-account messages only in the exact configured home thread and suppress reply echoes |
 | `BLUEBUBBLES_ALLOWED_USERS` | No | — | Comma-separated authorized users |
 | `BLUEBUBBLES_ALLOW_ALL_USERS` | No | `false` | Allow all users |
 | `BLUEBUBBLES_REQUIRE_MENTION` | No | `false` | Require a mention pattern before responding in group chats |
@@ -168,4 +184,3 @@ Without the Private API, basic text messaging and media still work.
 ### "Private API helper not connected"
 - Install the Private API helper: [docs.bluebubbles.app](https://docs.bluebubbles.app/helper-bundle/installation)
 - Basic messaging works without it — only reactions, typing, and read receipts require it
-

@@ -13,8 +13,9 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
@@ -122,6 +123,11 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             extra.get("server_url") or os.getenv("BLUEBUBBLES_SERVER_URL", "")
         )
         self.password = extra.get("password") or os.getenv("BLUEBUBBLES_PASSWORD", "")
+        self.webhook_secret = (
+            extra.get("webhook_secret")
+            or os.getenv("BLUEBUBBLES_WEBHOOK_SECRET", "")
+            or self.password
+        )
         self.webhook_host = (
             extra.get("webhook_host")
             or os.getenv("BLUEBUBBLES_WEBHOOK_HOST", DEFAULT_WEBHOOK_HOST)
@@ -151,6 +157,61 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self._private_api_enabled: Optional[bool] = None
         self._helper_connected: bool = False
         self._guid_cache: OrderedDict[str, str] = OrderedDict()
+        # Self-chat mode: process the operator's OWN (isFromMe) messages, but
+        # only in the designated home thread and never Hermes's own replies.
+        self.self_chat = str(
+            extra.get("self_chat")
+            if extra.get("self_chat") is not None
+            else os.getenv("BLUEBUBBLES_SELF_CHAT", "")
+        ).strip().lower() in {"true", "1", "yes", "on"}
+        self._home_channel_raw = (
+            extra.get("home_channel")
+            or os.getenv("BLUEBUBBLES_HOME_CHANNEL", "")
+            or ""
+        )
+        self._recent_sent_texts: deque = deque(maxlen=200)
+
+    # ------------------------------------------------------------------
+    # Self-chat helpers (operator talking to Hermes from their own account)
+    # ------------------------------------------------------------------
+
+    def _home_match_token(self) -> str:
+        """Address portion of the configured home channel, lowercased.
+
+        ``BLUEBUBBLES_HOME_CHANNEL`` may be a raw GUID like ``iMessage;-;user@x``
+        or a plain address; compare on the trailing address so any service
+        prefix matches.
+        """
+        raw = (self._home_channel_raw or "").strip().lower()
+        return raw.split(";")[-1].strip() if raw else ""
+
+    def _is_home_chat(
+        self, chat_guid: Optional[str], chat_identifier: Optional[str]
+    ) -> bool:
+        token = self._home_match_token()
+        if not token:
+            return False
+        for value in (chat_guid, chat_identifier):
+            if not value:
+                continue
+            candidate = value.strip().lower().split(";")[-1].strip()
+            if candidate == token:
+                return True
+        return False
+
+    def _record_sent_text(self, text: str) -> None:
+        """Remember an outgoing message so the self-chat echo-guard can skip it."""
+        t = (text or "").strip()
+        if t:
+            self._recent_sent_texts.append((time.monotonic(), t))
+
+    def _is_own_echo(self, text: str) -> bool:
+        """True if *text* matches a message Hermes sent in the last 5 minutes."""
+        t = (text or "").strip()
+        if not t:
+            return False
+        cutoff = time.monotonic() - 300.0
+        return any(ts >= cutoff and sent == t for ts, sent in self._recent_sent_texts)
 
     # ------------------------------------------------------------------
     # API helpers
@@ -305,7 +366,10 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         """Compute the external webhook URL for BlueBubbles registration."""
         host = self.webhook_host
         if host in {"0.0.0.0", "127.0.0.1", "localhost", "::"}:
-            host = "localhost"
+            # BlueBubbles may resolve localhost to ::1 while the Hermes
+            # listener is bound only on IPv4. Register the explicit loopback
+            # address so native webhook delivery cannot cross address families.
+            host = "127.0.0.1"
         return f"http://{host}:{self.webhook_port}{self.webhook_path}"
 
     @property
@@ -319,15 +383,15 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         way to authenticate inbound webhooks without disabling auth.
         """
         base = self._webhook_url
-        if self.password:
-            return f"{base}?password={quote(self.password, safe='')}"
+        if self.webhook_secret:
+            return f"{base}?password={quote(self.webhook_secret, safe='')}"
         return base
 
     @property
     def _webhook_register_url_for_log(self) -> str:
         """Webhook registration URL safe for logs."""
         base = self._webhook_url
-        if self.password:
+        if self.webhook_secret:
             return f"{base}?password=***"
         return base
 
@@ -520,6 +584,9 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 chunks.extend(self.truncate_message(para, max_length=self.MAX_MESSAGE_LENGTH))
         last = SendResult(success=True)
         for chunk in chunks:
+            # Record outgoing text BEFORE the POST so the self-chat echo-guard
+            # still works when the send times out but the message delivers.
+            self._record_sent_text(chunk)
             guid = await self._resolve_chat_guid(chat_id)
             if not guid:
                 # If the target looks like an address, try creating a new chat
@@ -548,7 +615,14 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                     success=True, message_id=str(msg_id), raw_response=res
                 )
             except Exception as exc:
-                return SendResult(success=False, error=str(exc))
+                # httpx timeout exceptions often stringify to an empty value.
+                # Preserve the exception type so BasePlatformAdapter recognizes
+                # the result as an ambiguous timeout and never sends a duplicate
+                # plain-text fallback for a message that may have delivered.
+                error = str(exc).strip()
+                if isinstance(exc, httpx.TimeoutException):
+                    error = f"{type(exc).__name__}: {error}".rstrip()
+                return SendResult(success=False, error=error or type(exc).__name__)
         return last
 
     # ------------------------------------------------------------------
@@ -872,7 +946,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             or request.headers.get("x-guid")
             or request.headers.get("x-bluebubbles-guid")
         )
-        if token != self.password:
+        if token != self.webhook_secret:
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
             raw = await request.read()
@@ -905,7 +979,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             or record.get("fromMe")
             or record.get("is_from_me")
         )
-        if is_from_me:
+        if is_from_me and not self.self_chat:
             return web.Response(text="ok")
 
         # Skip tapback reactions delivered as messages
@@ -1004,6 +1078,18 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 )
                 return web.Response(text="ok")
             text = self._clean_mention_text(text)
+        if is_from_me:
+            # Self-chat mode is on. Only accept the operator's own messages in
+            # the designated home thread, and never Hermes's own replies.
+            if not self._is_home_chat(chat_guid, chat_identifier):
+                return web.Response(text="ok")
+            if self._is_own_echo(text):
+                logger.info("[bluebubbles] self-chat: skipped own echo in home thread")
+                return web.Response(text="ok")
+            logger.info(
+                "[bluebubbles] self-chat: processing operator message in home thread (%s)",
+                chat_identifier or chat_guid,
+            )
         source = self.build_source(
             chat_id=session_chat_id,
             chat_name=chat_identifier or sender,

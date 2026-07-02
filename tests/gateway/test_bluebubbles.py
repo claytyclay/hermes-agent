@@ -104,6 +104,27 @@ class TestBlueBubblesHelpers:
         assert result.success is True
         assert sent == ["first thought", "second thought"]
 
+    @pytest.mark.asyncio
+    async def test_send_preserves_timeout_type_for_ambiguous_delivery(self, monkeypatch):
+        import httpx
+
+        adapter = _make_adapter(monkeypatch)
+
+        async def fake_resolve_chat_guid(chat_id):
+            return "iMessage;-;user@example.com"
+
+        async def fake_api_post(path, payload):
+            raise httpx.ReadTimeout("")
+
+        monkeypatch.setattr(adapter, "_resolve_chat_guid", fake_resolve_chat_guid)
+        monkeypatch.setattr(adapter, "_api_post", fake_api_post)
+
+        result = await adapter.send("user@example.com", "possibly delivered")
+
+        assert result.success is False
+        assert result.error == "ReadTimeout:"
+        assert adapter._is_timeout_error(result.error) is True
+
     def test_format_message_strips_markdown(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
         assert adapter.format_message("**Hello** `world`") == "Hello world"
@@ -261,6 +282,150 @@ class TestBlueBubblesMentionGating:
 
         assert response.status == 200
         assert [event.text for event in handled] == ["hello from a dm"]
+
+
+class TestBlueBubblesSelfChatSafety:
+    @staticmethod
+    def _own_message(text="operator prompt", address="owner@example.com"):
+        return {
+            "type": "new-message",
+            "data": {
+                "guid": "msg-self-1",
+                "text": text,
+                "handle": {"address": address},
+                "isFromMe": True,
+                "chatGuid": f"iMessage;-;{address}",
+                "chatIdentifier": address,
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_own_message_is_ignored_when_self_chat_is_disabled(self, monkeypatch):
+        adapter = _make_adapter(
+            monkeypatch,
+            self_chat=False,
+            home_channel="owner@example.com",
+            send_read_receipts=False,
+        )
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        response = await adapter._handle_webhook(
+            _FakeBlueBubblesRequest(self._own_message())
+        )
+        await asyncio.sleep(0)
+
+        assert response.status == 200
+        assert handled == []
+
+    @pytest.mark.asyncio
+    async def test_own_message_in_exact_home_thread_is_dispatched(self, monkeypatch):
+        adapter = _make_adapter(
+            monkeypatch,
+            self_chat=True,
+            home_channel="owner@example.com",
+            send_read_receipts=False,
+        )
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        response = await adapter._handle_webhook(
+            _FakeBlueBubblesRequest(self._own_message())
+        )
+        await asyncio.sleep(0)
+
+        assert response.status == 200
+        assert [event.text for event in handled] == ["operator prompt"]
+
+    @pytest.mark.asyncio
+    async def test_own_message_outside_home_thread_is_ignored(self, monkeypatch):
+        adapter = _make_adapter(
+            monkeypatch,
+            self_chat=True,
+            home_channel="owner@example.com",
+            send_read_receipts=False,
+        )
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        response = await adapter._handle_webhook(
+            _FakeBlueBubblesRequest(
+                self._own_message(address="other@example.com")
+            )
+        )
+        await asyncio.sleep(0)
+
+        assert response.status == 200
+        assert handled == []
+
+    def test_home_thread_match_rejects_substring_lookalike(self, monkeypatch):
+        adapter = _make_adapter(
+            monkeypatch,
+            self_chat=True,
+            home_channel="owner@example.com",
+        )
+
+        assert adapter._is_home_chat(
+            "iMessage;-;not-owner@example.com", "not-owner@example.com"
+        ) is False
+
+    @pytest.mark.asyncio
+    async def test_recent_sent_text_echo_is_ignored(self, monkeypatch):
+        adapter = _make_adapter(
+            monkeypatch,
+            self_chat=True,
+            home_channel="owner@example.com",
+            send_read_receipts=False,
+        )
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        adapter._record_sent_text("Hermes reply")
+        response = await adapter._handle_webhook(
+            _FakeBlueBubblesRequest(self._own_message(text="Hermes reply"))
+        )
+        await asyncio.sleep(0)
+
+        assert response.status == 200
+        assert handled == []
+
+    @pytest.mark.asyncio
+    async def test_expired_sent_text_no_longer_suppresses_operator(self, monkeypatch):
+        from gateway.platforms import bluebubbles
+
+        adapter = _make_adapter(
+            monkeypatch,
+            self_chat=True,
+            home_channel="owner@example.com",
+            send_read_receipts=False,
+        )
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        monkeypatch.setattr(bluebubbles.time, "monotonic", lambda: 1000.0)
+        adapter._recent_sent_texts.append((699.0, "repeat this"))
+        response = await adapter._handle_webhook(
+            _FakeBlueBubblesRequest(self._own_message(text="repeat this"))
+        )
+        await asyncio.sleep(0)
+
+        assert response.status == 200
+        assert [event.text for event in handled] == ["repeat this"]
 
 
 class TestBlueBubblesWebhookParsing:
@@ -658,19 +823,19 @@ class TestBlueBubblesAttachmentDownload:
 
 
 class TestBlueBubblesWebhookUrl:
-    """_webhook_url property normalises local hosts to 'localhost'."""
+    """_webhook_url uses an address-family-safe loopback registration."""
 
     def test_default_host(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
-        # Default webhook_host is 0.0.0.0 → normalized to localhost
-        assert "localhost" in adapter._webhook_url
+        # Default webhook_host is 0.0.0.0, registered explicitly over IPv4.
+        assert "127.0.0.1" in adapter._webhook_url
         assert str(adapter.webhook_port) in adapter._webhook_url
         assert adapter.webhook_path in adapter._webhook_url
 
     @pytest.mark.parametrize("host", ["0.0.0.0", "127.0.0.1", "localhost", "::"])
     def test_local_hosts_normalized(self, monkeypatch, host):
         adapter = _make_adapter(monkeypatch, webhook_host=host)
-        assert adapter._webhook_url.startswith("http://localhost:")
+        assert adapter._webhook_url.startswith("http://127.0.0.1:")
 
     def test_custom_host_preserved(self, monkeypatch):
         adapter = _make_adapter(monkeypatch, webhook_host="192.168.1.50")
@@ -687,6 +852,18 @@ class TestBlueBubblesWebhookUrl:
         adapter = _make_adapter(monkeypatch, password="W9fTC&L5JL*@")
         assert "password=W9fTC%26L5JL%2A%40" in adapter._webhook_register_url
 
+    def test_register_url_uses_separate_webhook_secret(self, monkeypatch):
+        adapter = _make_adapter(
+            monkeypatch,
+            password="api-password",
+            webhook_secret="inbound-only-secret",
+        )
+
+        assert adapter._webhook_register_url.endswith(
+            "?password=inbound-only-secret"
+        )
+        assert "api-password" not in adapter._webhook_register_url
+
     def test_register_url_for_log_masks_password(self, monkeypatch):
         """Log-safe webhook URLs must never expose the webhook password."""
         adapter = _make_adapter(monkeypatch, password="W9fTC&L5JL*@")
@@ -698,6 +875,7 @@ class TestBlueBubblesWebhookUrl:
     def test_register_url_omits_query_when_no_password(self, monkeypatch):
         """If no password is configured, the register URL should be the bare URL."""
         monkeypatch.delenv("BLUEBUBBLES_PASSWORD", raising=False)
+        monkeypatch.delenv("BLUEBUBBLES_WEBHOOK_SECRET", raising=False)
         from gateway.platforms.bluebubbles import BlueBubblesAdapter
         cfg = PlatformConfig(
             enabled=True,
@@ -705,6 +883,31 @@ class TestBlueBubblesWebhookUrl:
         )
         adapter = BlueBubblesAdapter(cfg)
         assert adapter._webhook_register_url == adapter._webhook_url
+
+    @pytest.mark.asyncio
+    async def test_webhook_auth_uses_separate_secret(self, monkeypatch):
+        adapter = _make_adapter(
+            monkeypatch,
+            password="api-password",
+            webhook_secret="inbound-only-secret",
+        )
+        payload = {
+            "type": "new-message",
+            "data": {
+                "guid": "msg-1",
+                "text": "hello",
+                "handle": {"address": "user@example.com"},
+                "isFromMe": False,
+                "chatGuid": "iMessage;-;user@example.com",
+                "chatIdentifier": "user@example.com",
+            },
+        }
+
+        rejected = await adapter._handle_webhook(
+            _FakeBlueBubblesRequest(payload, password="api-password")
+        )
+
+        assert rejected.status == 401
 
 
 class TestBlueBubblesWebhookRegistration:
