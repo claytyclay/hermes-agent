@@ -58,6 +58,88 @@ const WHATSAPP_DEBUG =
   typeof process.env.WHATSAPP_DEBUG === 'string' &&
   ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_DEBUG.toLowerCase());
 
+// --- Crash backstop -------------------------------------------------------
+// The bridge downloads media (images, docs, and especially voice notes) from
+// WhatsApp's CDN over undici's fetch. When that TLS socket is reset mid-stream
+// the failure surfaces as an 'error' event on the underlying Readable on a
+// later tick — out-of-band from the `await downloadMediaMessage(...)` call, so
+// a surrounding try/catch cannot catch it. Node then treats it as an unhandled
+// 'error' and exits the process (UND_ERR_SOCKET / "terminated"), dropping every
+// inbound message that was in flight. Voice notes are hit most because they are
+// larger and spend longer in transfer. These handlers keep the bridge alive
+// through such transient network faults; genuinely unexpected errors still log
+// and exit so a supervisor restarts cleanly rather than running corrupt.
+const RECOVERABLE_ERROR_CODES = new Set([
+  'UND_ERR_SOCKET',            // undici: socket closed mid-fetch (media download)
+  'ECONNRESET',                // peer reset the TLS connection
+  'ETIMEDOUT',
+  'EPIPE',
+  'ECONNABORTED',
+  'ERR_STREAM_PREMATURE_CLOSE',
+]);
+
+function isRecoverableNetworkError(err) {
+  if (!err) return false;
+  const codes = [err.code, err?.cause?.code, err?.cause?.name].filter(Boolean);
+  if (codes.some((c) => RECOVERABLE_ERROR_CODES.has(c))) return true;
+  // undici surfaces an aborted fetch as `TypeError: terminated`, and the TLS
+  // layer as "other side closed" / "socket hang up".
+  const msg = String((err && err.message) || err);
+  return /terminated|other side closed|socket hang up|aborted/i.test(msg);
+}
+
+function logProcessError(kind, err) {
+  try {
+    console.error(JSON.stringify({
+      event: 'process_error',
+      kind,                                      // uncaughtException | unhandledRejection
+      recoverable: isRecoverableNetworkError(err),
+      code: (err && (err.code || err?.cause?.code)) || null,
+      message: err && err.message ? String(err.message) : String(err),
+    }));
+  } catch (_) {}
+  console.error(`[bridge] ${kind}:`, err);        // full stack to stderr
+}
+
+process.on('uncaughtException', (err) => {
+  logProcessError('uncaughtException', err);
+  if (isRecoverableNetworkError(err)) {
+    // Transient media/socket fault: the affected download is lost but the
+    // bridge stays up so subsequent messages and the WA socket keep working.
+    return;
+  }
+  // Unknown fatal state: don't limp along silently. Flush logs, then exit
+  // non-zero so the supervisor restarts us cleanly.
+  setTimeout(() => process.exit(1), 100);
+});
+
+process.on('unhandledRejection', (reason) => {
+  // A rejected promise with no catch. Log it, but never exit — an unobserved
+  // rejection is far more often benign than fatal, and killing the bridge
+  // drops inbound messages.
+  logProcessError('unhandledRejection', reason);
+});
+
+// Bounded retry for media downloads. A transient CDN socket reset is common —
+// voice notes are large and spend longer in transfer, so they hit resets more
+// often — and one retry recovers most before the message is dropped.
+async function downloadMediaWithRetry(downloadFn, mediaMsg, { attempts = 2, delayMs = 400 } = {}) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await downloadFn(mediaMsg);
+    } catch (err) {
+      lastErr = err;
+      if (i < attempts - 1 && isRecoverableNetworkError(err)) {
+        await new Promise((r) => setTimeout(r, delayMs * (i + 1)));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr;
+}
+
 // Opt-in: when true (and WHATSAPP_MODE === 'bot'), fromMe inbound messages
 // that are NOT echoes of our own /send or /send-media calls are forwarded
 // to the Python adapter with `fromOwner: true`. This lets plugins detect
@@ -379,6 +461,21 @@ function rememberSentId(id) {
 let sock = null;
 let connectionState = 'disconnected';
 
+// Reconnect backoff. WhatsApp servers periodically close the socket on their
+// own (428 = idle/precondition close, 503 = stream error). A flat 3s retry
+// hammers the server during a rough patch and shows up as reconnect churn in
+// the logs. Back off exponentially with jitter, cap it, and reset to zero the
+// moment a connection actually opens — a single blip still recovers fast while
+// a sustained outage stops thrashing.
+let reconnectAttempts = 0;
+const RECONNECT_BASE_MS = 3000;
+const RECONNECT_CAP_MS = 60000;
+function nextReconnectDelayMs() {
+  const exp = Math.min(RECONNECT_BASE_MS * 2 ** reconnectAttempts, RECONNECT_CAP_MS);
+  const jitter = Math.floor(Math.random() * 1000); // spread retries, avoid lockstep
+  return exp + jitter;
+}
+
 function emitPairEvent(event) {
   if (!PAIR_JSON) return;
   try {
@@ -433,19 +530,28 @@ async function startSocket() {
         }
         process.exit(1);
       } else {
-        // 515 = restart requested (common after pairing). Always reconnect.
+        // 515 = restart requested (common after pairing). It's an expected
+        // handshake step, not a failure, so reconnect fast and don't count it
+        // toward the backoff. Everything else backs off exponentially.
         emitPairEvent({ event: 'disconnected', reason });
-        if (!PAIR_JSON) {
-          if (reason === 515) {
+        let reconnectDelay;
+        if (reason === 515) {
+          reconnectDelay = 1000;
+          if (!PAIR_JSON) {
             console.log('↻ WhatsApp requested restart (code 515). Reconnecting...');
-          } else {
-            console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in 3s...`);
+          }
+        } else {
+          reconnectAttempts += 1;
+          reconnectDelay = nextReconnectDelayMs();
+          if (!PAIR_JSON) {
+            console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in ${(reconnectDelay / 1000).toFixed(1)}s (attempt ${reconnectAttempts})...`);
           }
         }
-        setTimeout(startSocket, reason === 515 ? 1000 : 3000);
+        setTimeout(startSocket, reconnectDelay);
       }
     } else if (connection === 'open') {
       connectionState = 'connected';
+      reconnectAttempts = 0; // healthy connection — reset backoff
       const connectedUser = sock?.user
         ? {
             id: sock.user.id || null,
@@ -707,20 +813,34 @@ async function startSocket() {
         continue;
       }
 
-      const event = await extractBridgeEvent({
-        msg,
-        chatId,
-        senderId,
-        senderNumber,
-        botIds,
-        isGroup,
-        downloadMedia: async (mediaMsg) => downloadMediaMessage(mediaMsg, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage }),
-        cacheDirs: {
-          image: IMAGE_CACHE_DIR,
-          document: DOCUMENT_CACHE_DIR,
-          audio: AUDIO_CACHE_DIR,
-        },
-      });
+      // Media download/decode must never take down the bridge. A transient CDN
+      // socket reset (esp. on large voice notes) otherwise rejects here and, if
+      // it escapes as an out-of-band stream 'error', crashes the process. Retry
+      // the download once, and on hard failure skip this one message rather than
+      // dropping the whole in-flight batch.
+      let event;
+      try {
+        event = await extractBridgeEvent({
+          msg,
+          chatId,
+          senderId,
+          senderNumber,
+          botIds,
+          isGroup,
+          downloadMedia: async (mediaMsg) => downloadMediaWithRetry(
+            (m) => downloadMediaMessage(m, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage }),
+            mediaMsg,
+          ),
+          cacheDirs: {
+            image: IMAGE_CACHE_DIR,
+            document: DOCUMENT_CACHE_DIR,
+            audio: AUDIO_CACHE_DIR,
+          },
+        });
+      } catch (extractErr) {
+        console.error('[bridge] extractBridgeEvent failed (media download/decode); skipping message:', extractErr);
+        continue;
+      }
       event.fromOwner = fromOwner;
 
       // Ignore Hermes' own reply messages in self-chat mode to avoid loops.
