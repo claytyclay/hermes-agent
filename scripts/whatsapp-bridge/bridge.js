@@ -839,6 +839,29 @@ async function startSocket() {
         });
       } catch (extractErr) {
         console.error('[bridge] extractBridgeEvent failed (media download/decode); skipping message:', extractErr);
+        // The message never reaches the agent, so from the sender's side the
+        // bot just goes silent on a failed voice note / attachment. Send a
+        // deterministic (non-LLM) reply asking them to resend, reusing the
+        // echo-safe send path. Scoped to inbound DMs to avoid group noise; any
+        // send failure is swallowed so we still skip the message cleanly.
+        const failedKeys = Object.keys(msg.message || {});
+        const isVoiceNote = failedKeys.includes('audioMessage');
+        if (!msg.key.fromMe && !isGroup && sock && connectionState === 'connected') {
+          const nudgeText = isVoiceNote
+            ? '🎙️ I got your voice message but couldn’t download it from WhatsApp just now — could you resend it?'
+            : '📎 I got your attachment but couldn’t download it from WhatsApp just now — could you resend it?';
+          try {
+            const { content: nudgePayload, options: nudgeOptions } = buildTextSendPayload(
+              formatOutgoingMessage(nudgeText),
+              { chatId, replyTo: msg.key.id, messageStore },
+            );
+            const sentNudge = await sendWithTimeout(chatId, nudgePayload, nudgeOptions);
+            trackSentMessageId(sentNudge);
+            messageStore.remember(sentNudge);
+          } catch (nudgeErr) {
+            console.error('[bridge] failed to send media-failure resend nudge:', nudgeErr);
+          }
+        }
         continue;
       }
       event.fromOwner = fromOwner;
